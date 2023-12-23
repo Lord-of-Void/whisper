@@ -71,6 +71,7 @@ def transcribe(
     A dictionary containing the resulting text ("text") and segment-level details ("segments"), and
     the spoken language ("language"), which is detected when `decode_options["language"]` is None.
     """
+
     dtype = torch.float16 if decode_options.get("fp16", True) else torch.float32
     if model.device == torch.device("cpu"):
         if torch.cuda.is_available():
@@ -145,7 +146,7 @@ def transcribe(
         all_tokens.extend(initial_prompt)
 
     def add_segment(
-        *, start: float, end: float, text_tokens: torch.Tensor, result: DecodingResult, encoder_embeddings, decoder_embeddings
+        *, start: float, end: float, text_tokens: torch.Tensor, result: DecodingResult, encoder_embeddings, decoder_embeddings, audio_features
     ):
         text = tokenizer.decode([token for token in text_tokens if token < tokenizer.eot])
         if len(text.strip()) == 0:  # skip empty text output
@@ -164,7 +165,8 @@ def transcribe(
                 "compression_ratio": result.compression_ratio,
                 "no_speech_prob": result.no_speech_prob,
                 "encoder_embeddings":encoder_embeddings,
-                "decoder_embeddings":decoder_embeddings
+                "decoder_embeddings":decoder_embeddings,
+                "audio_features":audio_features
             }
         )
         if verbose:
@@ -173,6 +175,7 @@ def transcribe(
     # show the progress bar when verbose is False (otherwise the transcribed text will be printed)
     num_frames = mel.shape[-1]
     previous_seek_value = seek
+
 
     with tqdm.tqdm(total=num_frames, unit='frames', disable=verbose is not False) as pbar:
         while seek < num_frames:
@@ -195,10 +198,19 @@ def transcribe(
                     seek += segment.shape[-1]  # fast-forward to the next segment boundary
                     continue
 
+            # print(result)
+            # print(result.audio_features.shape, result.encoder_embeddings.shape, result.decoder_embeddings.shape)
+
+            encoder_embeddings = result.encoder_embeddings
+            decoder_embeddings = result.decoder_embeddings
+            audio_features = result.audio_features
+
             timestamp_tokens: torch.Tensor = tokens.ge(tokenizer.timestamp_begin)
             consecutive = torch.where(timestamp_tokens[:-1] & timestamp_tokens[1:])[0].add_(1)
+            # print(consecutive)
             if len(consecutive) > 0:  # if the output contains two consecutive timestamp tokens
                 last_slice = 0
+                # print("a")
                 for current_slice in consecutive:
                     sliced_tokens = tokens[last_slice:current_slice]
                     start_timestamp_position = (
@@ -208,6 +220,7 @@ def transcribe(
                         sliced_tokens[-1].item() - tokenizer.timestamp_begin,
                         np.ceil((num_frames - seek) / input_stride) - 1
                     )
+
                     encoder_embeddings = result.encoder_embeddings[:, :,
                                          start_timestamp_position:int(end_timestamp_position)]
                     decoder_embeddings = result.decoder_embeddings[:,:, int(last_slice)+1:int(current_slice)-1]
@@ -218,7 +231,8 @@ def transcribe(
                         text_tokens=sliced_tokens[1:-1],
                         result=result,
                         encoder_embeddings=encoder_embeddings,
-                        decoder_embeddings=decoder_embeddings
+                        decoder_embeddings=decoder_embeddings,
+                        audio_features=audio_features
                     )
                     last_slice = current_slice
                 last_timestamp_position = (
@@ -227,9 +241,14 @@ def transcribe(
                 seek += last_timestamp_position * input_stride
                 all_tokens.extend(tokens[: last_slice + 1].tolist())
             else:
+                # print("b")
                 duration = segment_duration
                 timestamps = tokens[timestamp_tokens.nonzero().flatten()]
+                # print(timestamp_tokens)
+                # print(duration)
+                # print(tokens)
                 if len(timestamps) > 0 and timestamps[-1].item() != tokenizer.timestamp_begin:
+                    # print("c")
                     # no consecutive timestamps but it has a timestamp; use the last one.
                     # single timestamp at the end means no speech after the last timestamp.
                     last_timestamp_position = min(
@@ -245,6 +264,7 @@ def transcribe(
                                          start_timestamp_position:int(last_timestamp_position)]
                     decoder_embeddings = result.decoder_embeddings[:, :, 1:-1]
                 elif force_extraction:
+                    # print("d")
                     # no consecutive timestamps but it has a timestamp; use the last one.
                     # single timestamp at the end means no speech after the last timestamp.
                     end_position = np.ceil((num_frames - seek) / input_stride) - 1
@@ -253,6 +273,7 @@ def transcribe(
                     start_timestamp_position = (
                             timestamps[0].item() - tokenizer.timestamp_begin
                     )
+                    # print(result)
                     encoder_embeddings = result.encoder_embeddings[:, :,
                                      start_timestamp_position:int(end_position)]
                     decoder_embeddings = result.decoder_embeddings[:, :, 1:-1]
@@ -262,7 +283,8 @@ def transcribe(
                     text_tokens=tokens,
                     result=result,
                     encoder_embeddings=encoder_embeddings,
-                    decoder_embeddings=decoder_embeddings
+                    decoder_embeddings=decoder_embeddings,
+                    audio_features=audio_features
                 )
 
                 seek += segment.shape[-1]
