@@ -465,7 +465,6 @@ class DecodingTask:
 
         self.initial_tokens: Tuple[int] = self._get_initial_tokens()
         self.sample_begin: int = len(self.initial_tokens)
-        self.sot_index: int = self.initial_tokens.index(tokenizer.sot)
         # self.sot_index: int = self.initial_tokens.index(tokenizer.sot)
         # print(self.initial_tokens)
         # print(tokenizer.sot)
