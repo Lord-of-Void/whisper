@@ -22,10 +22,11 @@ def transcribe(
     *,
     verbose: Optional[bool] = None,
     temperature: Union[float, Tuple[float, ...]] = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
-    compression_ratio_threshold: Optional[float] = 2.4,
+    compression_ratio_threshold: Optional[float] = -2.4,
     logprob_threshold: Optional[float] = -1.0,
-    no_speech_threshold: Optional[float] = 0.6,
-    condition_on_previous_text: bool = True,
+    no_speech_threshold: Optional[float] = 1,
+    condition_on_previous_text: bool = False,
+    force_extraction: bool = True,
     **decode_options,
 ):
     """
@@ -70,6 +71,10 @@ def transcribe(
     A dictionary containing the resulting text ("text") and segment-level details ("segments"), and
     the spoken language ("language"), which is detected when `decode_options["language"]` is None.
     """
+    # if torch.cuda.is_available():
+    #     print("CUAD IS AVAILABLE")
+    #     device = "cuda:0"
+
     dtype = torch.float16 if decode_options.get("fp16", True) else torch.float32
     if model.device == torch.device("cpu"):
         if torch.cuda.is_available():
@@ -84,13 +89,16 @@ def transcribe(
     mel = log_mel_spectrogram(audio)
 
     if decode_options.get("language", None) is None:
-        if verbose:
-            print("Detecting language using up to the first 30 seconds. Use `--language` to specify the language")
-        segment = pad_or_trim(mel, N_FRAMES).to(model.device).to(dtype)
-        _, probs = model.detect_language(segment)
-        decode_options["language"] = max(probs, key=probs.get)
-        if verbose is not None:
-            print(f"Detected language: {LANGUAGES[decode_options['language']].title()}")
+        if not model.is_multilingual:
+            decode_options["language"] = "en"
+        else:
+            if verbose:
+                print("Detecting language using up to the first 30 seconds. Use `--language` to specify the language")
+            segment = pad_or_trim(mel, N_FRAMES).to(model.device).to(dtype)
+            _, probs = model.detect_language(segment)
+            decode_options["language"] = max(probs, key=probs.get)
+            if verbose is not None:
+                print(f"Detected language: {LANGUAGES[decode_options['language']].title()}")
 
     language = decode_options["language"]
     task = decode_options.get("task", "transcribe")
@@ -141,7 +149,7 @@ def transcribe(
         all_tokens.extend(initial_prompt)
 
     def add_segment(
-        *, start: float, end: float, text_tokens: torch.Tensor, result: DecodingResult
+        *, start: float, end: float, text_tokens: torch.Tensor, result: DecodingResult, encoder_embeddings, decoder_embeddings, audio_features
     ):
         text = tokenizer.decode([token for token in text_tokens if token < tokenizer.eot])
         if len(text.strip()) == 0:  # skip empty text output
@@ -159,6 +167,9 @@ def transcribe(
                 "avg_logprob": result.avg_logprob,
                 "compression_ratio": result.compression_ratio,
                 "no_speech_prob": result.no_speech_prob,
+                "encoder_embeddings":encoder_embeddings,
+                "decoder_embeddings":decoder_embeddings,
+                "audio_features":audio_features
             }
         )
         if verbose:
@@ -167,6 +178,7 @@ def transcribe(
     # show the progress bar when verbose is False (otherwise the transcribed text will be printed)
     num_frames = mel.shape[-1]
     previous_seek_value = seek
+
 
     with tqdm.tqdm(total=num_frames, unit='frames', disable=verbose is not False) as pbar:
         while seek < num_frames:
@@ -189,23 +201,41 @@ def transcribe(
                     seek += segment.shape[-1]  # fast-forward to the next segment boundary
                     continue
 
+            # print(result)
+            # print(result.audio_features.shape, result.encoder_embeddings.shape, result.decoder_embeddings.shape)
+
+            encoder_embeddings = result.encoder_embeddings
+            decoder_embeddings = result.decoder_embeddings
+            audio_features = result.audio_features
+
             timestamp_tokens: torch.Tensor = tokens.ge(tokenizer.timestamp_begin)
             consecutive = torch.where(timestamp_tokens[:-1] & timestamp_tokens[1:])[0].add_(1)
+            # print(consecutive)
             if len(consecutive) > 0:  # if the output contains two consecutive timestamp tokens
                 last_slice = 0
+                # print("a")
                 for current_slice in consecutive:
                     sliced_tokens = tokens[last_slice:current_slice]
                     start_timestamp_position = (
                         sliced_tokens[0].item() - tokenizer.timestamp_begin
                     )
-                    end_timestamp_position = (
-                        sliced_tokens[-1].item() - tokenizer.timestamp_begin
+                    end_timestamp_position = min(
+                        sliced_tokens[-1].item() - tokenizer.timestamp_begin,
+                        np.ceil((num_frames - seek) / input_stride) - 1
                     )
+
+                    encoder_embeddings = result.encoder_embeddings[:, :,
+                                         start_timestamp_position:int(end_timestamp_position)]
+                    decoder_embeddings = result.decoder_embeddings[:,:, int(last_slice)+1:int(current_slice)-1]
+
                     add_segment(
                         start=timestamp_offset + start_timestamp_position * time_precision,
                         end=timestamp_offset + end_timestamp_position * time_precision,
                         text_tokens=sliced_tokens[1:-1],
                         result=result,
+                        encoder_embeddings=encoder_embeddings,
+                        decoder_embeddings=decoder_embeddings,
+                        audio_features=audio_features
                     )
                     last_slice = current_slice
                 last_timestamp_position = (
@@ -214,19 +244,50 @@ def transcribe(
                 seek += last_timestamp_position * input_stride
                 all_tokens.extend(tokens[: last_slice + 1].tolist())
             else:
+                # print("b")
                 duration = segment_duration
                 timestamps = tokens[timestamp_tokens.nonzero().flatten()]
+                # print(timestamp_tokens)
+                # print(duration)
+                # print(tokens)
                 if len(timestamps) > 0 and timestamps[-1].item() != tokenizer.timestamp_begin:
+                    # print("c")
                     # no consecutive timestamps but it has a timestamp; use the last one.
                     # single timestamp at the end means no speech after the last timestamp.
-                    last_timestamp_position = timestamps[-1].item() - tokenizer.timestamp_begin
+                    last_timestamp_position = min(
+                        timestamps[-1].item() - tokenizer.timestamp_begin,
+                        np.ceil((num_frames - seek) / input_stride) - 1
+                    )
                     duration = last_timestamp_position * time_precision
 
+                    start_timestamp_position = (
+                            timestamps[0].item() - tokenizer.timestamp_begin
+                    )
+                    encoder_embeddings = result.encoder_embeddings[:, :,
+                                         start_timestamp_position:int(last_timestamp_position)]
+                    decoder_embeddings = result.decoder_embeddings[:, :, 1:-1]
+                elif force_extraction:
+                    # print("d")
+                    # no consecutive timestamps but it has a timestamp; use the last one.
+                    # single timestamp at the end means no speech after the last timestamp.
+                    end_position = np.ceil((num_frames - seek) / input_stride) - 1
+                    duration = end_position * time_precision
+
+                    start_timestamp_position = (
+                            timestamps[0].item() - tokenizer.timestamp_begin
+                    )
+                    # print(result)
+                    encoder_embeddings = result.encoder_embeddings[:, :,
+                                     start_timestamp_position:int(end_position)]
+                    decoder_embeddings = result.decoder_embeddings[:, :, 1:-1]
                 add_segment(
                     start=timestamp_offset,
                     end=timestamp_offset + duration,
                     text_tokens=tokens,
                     result=result,
+                    encoder_embeddings=encoder_embeddings,
+                    decoder_embeddings=decoder_embeddings,
+                    audio_features=audio_features
                 )
 
                 seek += segment.shape[-1]
@@ -261,7 +322,7 @@ def cli():
     parser.add_argument("--best_of", type=optional_int, default=5, help="number of candidates when sampling with non-zero temperature")
     parser.add_argument("--beam_size", type=optional_int, default=5, help="number of beams in beam search, only applicable when temperature is zero")
     parser.add_argument("--patience", type=float, default=None, help="optional patience value to use in beam decoding, as in https://arxiv.org/abs/2204.05424, the default (1.0) is equivalent to conventional beam search")
-    parser.add_argument("--length_penalty", type=float, default=None, help="optional token length penalty coefficient (alpha) as in https://arxiv.org/abs/1609.08144, uses simple lengt normalization by default")
+    parser.add_argument("--length_penalty", type=float, default=None, help="optional token length penalty coefficient (alpha) as in https://arxiv.org/abs/1609.08144, uses simple length normalization by default")
 
     parser.add_argument("--suppress_tokens", type=str, default="-1", help="comma-separated list of token ids to suppress during sampling; '-1' will suppress most special characters except common punctuations")
     parser.add_argument("--initial_prompt", type=str, default=None, help="optional text to provide as a prompt for the first window.")
@@ -272,6 +333,7 @@ def cli():
     parser.add_argument("--compression_ratio_threshold", type=optional_float, default=2.4, help="if the gzip compression ratio is higher than this value, treat the decoding as failed")
     parser.add_argument("--logprob_threshold", type=optional_float, default=-1.0, help="if the average log probability is lower than this value, treat the decoding as failed")
     parser.add_argument("--no_speech_threshold", type=optional_float, default=0.6, help="if the probability of the <|nospeech|> token is higher than this value AND the decoding has failed due to `logprob_threshold`, consider the segment as silence")
+    parser.add_argument("--threads", type=optional_int, default=0, help="number of threads used by torch for CPU inference; supercedes MKL_NUM_THREADS/OMP_NUM_THREADS")
 
     args = parser.parse_args().__dict__
     model_name: str = args.pop("model")
@@ -281,7 +343,8 @@ def cli():
     os.makedirs(output_dir, exist_ok=True)
 
     if model_name.endswith(".en") and args["language"] not in {"en", "English"}:
-        warnings.warn(f"{model_name} is an English-only model but receipted '{args['language']}'; using English instead.")
+        if args["language"] is not None:
+            warnings.warn(f"{model_name} is an English-only model but receipted '{args['language']}'; using English instead.")
         args["language"] = "en"
 
     temperature = args.pop("temperature")
@@ -290,6 +353,10 @@ def cli():
         temperature = tuple(np.arange(temperature, 1.0 + 1e-6, temperature_increment_on_fallback))
     else:
         temperature = [temperature]
+
+    threads = args.pop("threads")
+    if threads > 0:
+        torch.set_num_threads(threads)
 
     from . import load_model
     model = load_model(model_name, device=device, download_root=model_dir)
