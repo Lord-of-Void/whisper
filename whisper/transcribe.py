@@ -22,11 +22,11 @@ def transcribe(
     *,
     verbose: Optional[bool] = None,
     temperature: Union[float, Tuple[float, ...]] = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
-    compression_ratio_threshold: Optional[float] = -2.4,
+    compression_ratio_threshold: Optional[float] = 2.4,
     logprob_threshold: Optional[float] = -1.0,
-    no_speech_threshold: Optional[float] = 1,
-    condition_on_previous_text: bool = False,
-    force_extraction: bool = True,
+    no_speech_threshold: Optional[float] = 0.6,
+    condition_on_previous_text: bool = True,
+    force_extraction: bool = False,
     **decode_options,
 ):
     """
@@ -71,9 +71,6 @@ def transcribe(
     A dictionary containing the resulting text ("text") and segment-level details ("segments"), and
     the spoken language ("language"), which is detected when `decode_options["language"]` is None.
     """
-    # if torch.cuda.is_available():
-    #     print("CUAD IS AVAILABLE")
-    #     device = "cuda:0"
 
     dtype = torch.float16 if decode_options.get("fp16", True) else torch.float32
     if model.device == torch.device("cpu"):
